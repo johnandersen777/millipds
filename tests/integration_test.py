@@ -1,22 +1,23 @@
-import requests
 import os
-import atexit
-import shutil
 import asyncio
-import inspect
 import tempfile
-import functools
 import urllib.parse
 import unittest.mock
 import pytest
-from aiohttp import web
-import snoop
+import dataclasses
+import aiohttp
 
 from millipds import service
 from millipds import database
+from millipds import crypto
+
+@dataclasses.dataclass
+class TestPDS:
+    endpoint: str
+    db: database.Database
 
 
-old_web_tcpsite_start = web.TCPSite.start
+old_web_tcpsite_start = aiohttp.web.TCPSite.start
 
 def make_capture_random_bound_port_web_tcpsite_startstart(queue):
     async def mock_start(site, *args, **kwargs):
@@ -25,13 +26,23 @@ def make_capture_random_bound_port_web_tcpsite_startstart(queue):
         await queue.put(site._server.sockets[0].getsockname()[1])
     return mock_start
 
-async def service_run_and_capture_port(queue, service, **kwargs):
+async def service_run_and_capture_port(queue,  **kwargs):
     mock_start = make_capture_random_bound_port_web_tcpsite_startstart(queue)
-    with unittest.mock.patch.object(web.TCPSite, "start", new=mock_start):
+    with unittest.mock.patch.object(aiohttp.web.TCPSite, "start", new=mock_start):
         await service.run(**kwargs)
 
+if 0:
+    TEST_DID = "did:web:alice.test"
+    TEST_HANDLE = "alice.test"
+    TEST_PASSWORD = "alice_pw"
+else:
+    TEST_DID = "did:plc:bwxddkvw5c6pkkntbtp2j4lx"
+    TEST_HANDLE = "local.dev.retr0.id"
+    TEST_PASSWORD = "lol"
+TEST_PRIVKEY = crypto.keygen_p256()
+
 @pytest.fixture
-async def PDS(aiolib):
+async def test_pds(aiolib):
     queue = asyncio.Queue()
     with tempfile.TemporaryDirectory() as tempdir:
         db_path = f"{tempdir}/millipds-0000.db"
@@ -48,7 +59,6 @@ async def PDS(aiolib):
         service_run_task = asyncio.create_task(
             service_run_and_capture_port(
                 queue,
-                service,
                 db=db,
                 sock_path=None,
                 host="localhost",
@@ -72,9 +82,18 @@ async def PDS(aiolib):
             bsky_appview_pfx="https://api.bsky.app",
             bsky_appview_did="did:web:api.bsky.app",
         )
+        db.create_account(
+            did=TEST_DID,
+            handle=TEST_HANDLE,
+            password=TEST_PASSWORD,
+            privkey=TEST_PRIVKEY,
+        )
 
         try:
-            yield f"http://{hostname}"
+            yield TestPDS(
+                endpoint=f"http://{hostname}",
+                db=db,
+            )
         finally:
             service_run_task.cancel()
             try:
@@ -82,149 +101,169 @@ async def PDS(aiolib):
             except asyncio.CancelledError:
                 pass
 
-async def test_integration(PDS, aiolib):
-    if 0:
-        TEST_DID = "did:web:alice.test"
-        TEST_HANDLE = "alice.test"
-        TEST_PASSWORD = "alice_pw"
-    else:
-        TEST_DID = "did:plc:bwxddkvw5c6pkkntbtp2j4lx"
-        TEST_HANDLE = "local.dev.retr0.id"
-        TEST_PASSWORD = "lol"
+@pytest.fixture
+async def s(aiolib):
+    async with aiohttp.ClientSession() as s:
+        yield s
 
-    s = requests.session()
+@pytest.fixture
+def PDS(test_pds):
+    return test_pds.endpoint
 
-    # hello world
-    r = s.get(PDS + "/").text
-    print(r)
-    assert "Hello" in r
+async def test_hello_world(s, PDS):
+    async with s.get(PDS + "/") as r:
+        r = await r.text()
+        print(r)
+        assert "Hello" in r
 
-    # describeServer
-    r = s.get(PDS + "/xrpc/com.atproto.server.describeServer")
-    print(r.json())
+async def test_describeServer(s, PDS):
+    async with s.get(PDS + "/xrpc/com.atproto.server.describeServer") as r:
+        print(await r.json())
 
+async def test_createSession_no_args(s, PDS):
     # no args
-    r = s.post(PDS + "/xrpc/com.atproto.server.createSession")
-    assert not r.ok
+    async with s.post(PDS + "/xrpc/com.atproto.server.createSession") as r:
+        assert r.status != 200
 
-    # invalid logins
-    r = s.post(
+invalid_logins = [
+    {"identifier": [], "password": "123"},
+    {"identifier": "example.invalid", "password": "wrongPassword123"},
+    {"identifier": TEST_HANDLE, "password": "wrongPassword123"},
+]
+
+@pytest.mark.parametrize("login_data", invalid_logins)
+async def test_invalid_logins(s, PDS, login_data):
+    async with s.post(
         PDS + "/xrpc/com.atproto.server.createSession",
-        json={"identifier": [], "password": "123"},
-    )
-    assert not r.ok
+        json=login_data,
+    ) as r:
+        assert r.status != 200
 
-    r = s.post(
+valid_logins = [
+    {"identifier": TEST_HANDLE, "password": TEST_PASSWORD},
+    {"identifier": TEST_DID, "password": TEST_PASSWORD},
+]
+
+@pytest.mark.parametrize("login_data", valid_logins)
+async def test_valid_logins(s, PDS, login_data):
+    async with s.post(
         PDS + "/xrpc/com.atproto.server.createSession",
-        json={"identifier": "example.invalid", "password": "wrongPassword123"},
-    )
-    assert not r.ok
-
-    r = s.post(
-        PDS + "/xrpc/com.atproto.server.createSession",
-        json={"identifier": TEST_HANDLE, "password": "wrongPassword123"},
-    )
-    assert not r.ok
-
-
-    # valid logins
-
-    # by handle
-    r = s.post(
-        PDS + "/xrpc/com.atproto.server.createSession",
-        json={"identifier": TEST_HANDLE, "password": TEST_PASSWORD},
-    )
-    print(r.text)
-    r = r.json()
-    print(r)
-    assert r["did"] == TEST_DID
-    assert r["handle"] == TEST_HANDLE
-    assert "accessJwt" in r
-    assert "refreshJwt" in r
-
-    # by did
-    r = s.post(
-        PDS + "/xrpc/com.atproto.server.createSession",
-        json={"identifier": TEST_DID, "password": TEST_PASSWORD},
-    )
-    r = r.json()
-    print(r)
-    assert r["did"] == TEST_DID
-    assert r["handle"] == TEST_HANDLE
-    assert "accessJwt" in r
-    assert "refreshJwt" in r
+        json=login_data,
+    ) as r:
+        r = await r.json()
+        assert r["did"] == TEST_DID
+        assert r["handle"] == TEST_HANDLE
+        assert "accessJwt" in r
+        assert "refreshJwt" in r
 
     token = r["accessJwt"]
     authn = {"Authorization": "Bearer " + token}
 
     # good auth
-    r = s.get(PDS + "/xrpc/com.atproto.server.getSession", headers=authn)
-    print(r.json())
-    assert r.ok
+    async with s.get(
+        PDS + "/xrpc/com.atproto.server.getSession",
+        headers=authn,
+    ) as r:
+        print(await r.json())
+        assert r.status == 200
 
     # bad auth
-    r = s.get(
+    async with s.get(
         PDS + "/xrpc/com.atproto.server.getSession",
         headers={"Authorization": "Bearer " + token[:-1]},
-    )
-    print(r.text)
-    assert not r.ok
+    ) as r:
+        print(await r.text())
+        assert r.status != 200
 
     # bad auth
-    r = s.get(
-        PDS + "/xrpc/com.atproto.server.getSession", headers={"Authorization": "Bearest"}
-    )
-    print(r.text)
-    assert not r.ok
+    async with s.get(
+        PDS + "/xrpc/com.atproto.server.getSession",
+        headers={"Authorization": "Bearest"},
+    ) as r:
+        print(await r.text())
+        assert r.status != 200
 
+async def test_sync_getRepo(s, PDS):
+    async with s.get(
+        PDS + "/xrpc/com.atproto.sync.getRepo",
+        params={"did": TEST_DID},
+    ) as r:
+        assert r.status == 200
 
-    r = s.get(PDS + "/xrpc/com.atproto.sync.getRepo", params={"did": TEST_DID})
-    assert r.ok
+@pytest.fixture
+async def authn(s, PDS):
+    async with s.post(
+        PDS + "/xrpc/com.atproto.server.createSession",
+        json=valid_logins[0],
+    ) as r:
+        r = await r.json()
+    token = r["accessJwt"]
+    return {"Authorization": "Bearer " + token}
 
-
+async def test_repo_applyWrites(s, PDS, authn):
     for i in range(10):
-        r = s.post(PDS + "/xrpc/com.atproto.repo.applyWrites", headers=authn, json={
-            "repo": TEST_DID,
-            "writes": [{
-                "$type": "com.atproto.repo.applyWrites#create",
-                "action": "create",
-                "collection": "app.bsky.feed.like",
-                "rkey": f"{i}-{j}",
-                "value": {
-                    "blah": "test record"
-                }
-            } for j in range(30)]
-        })
-        print(r.json())
-        assert r.ok
+        async with s.post(
+            PDS + "/xrpc/com.atproto.repo.applyWrites",
+            headers=authn,
+            json={
+                "repo": TEST_DID,
+                "writes": [{
+                    "$type": "com.atproto.repo.applyWrites#create",
+                    "action": "create",
+                    "collection": "app.bsky.feed.like",
+                    "rkey": f"{i}-{j}",
+                    "value": {
+                        "blah": "test record"
+                    }
+                } for j in range(30)]
+            },
+        ) as r:
+            print(await r.json())
+            assert r.status == 200
 
-
+async def test_repo_uploadBlob(s, PDS, authn):
     blob = os.urandom(0x100000)
+
     for _ in range(2): # test reupload is nop
-        r = s.post(PDS + "/xrpc/com.atproto.repo.uploadBlob", data=blob, headers=authn|{"content-type": "blah"})
-        res = r.json()
-        print(res)
-        assert r.ok
+        async with s.post(
+            PDS + "/xrpc/com.atproto.repo.uploadBlob",
+            headers=authn|{"content-type": "blah"},
+            data=blob,
+        ) as r:
+            res = await r.json()
+            print(res)
+            assert r.status == 200
 
     # get the blob refcount >0
-    r = s.post(PDS + "/xrpc/com.atproto.repo.createRecord", headers=authn, json={
-        "repo": TEST_DID,
-        "collection": "app.bsky.feed.post",
-        "record": {"myblob": res}
-    })
-    print(r.json())
-    assert(r.ok)
+    async with s.post(
+        PDS + "/xrpc/com.atproto.repo.createRecord",
+        headers=authn,
+        json={
+            "repo": TEST_DID,
+            "collection": "app.bsky.feed.post",
+            "record": {"myblob": res}
+        },
+    ) as r:
+        print(await r.json())
+        assert r.status == 200
 
-    r = s.get(PDS + "/xrpc/com.atproto.sync.getBlob", params={"did": TEST_DID, "cid": res["blob"]["ref"]["$link"]})
-    downloaded_blob = r.content
-    assert(downloaded_blob == blob)
+    async with s.get(
+        PDS + "/xrpc/com.atproto.sync.getBlob",
+        params={"did": TEST_DID, "cid": res["blob"]["ref"]["$link"]},
+    ) as r:
+        downloaded_blob = await r.read()
+        assert(downloaded_blob == blob)
 
-    r = s.get(PDS + "/xrpc/com.atproto.sync.getRepo", params={"did": TEST_DID})
-    assert r.ok
-    open("repo.car", "wb").write(r.content)
+    async with s.get(
+        PDS + "/xrpc/com.atproto.sync.getRepo",
+        params={"did": TEST_DID},
+    ) as r:
+        assert r.status == 200
+        open("repo.car", "wb").write(await r.read())
 
-    r = s.get(PDS + "/xrpc/com.atproto.sync.getRepo", params={"did": "did:web:nonexistent.invalid"})
-    assert not r.ok
-    assert r.status_code == 404
-
-    print("we got to the end of the script!")
+async def test_sync_getRepo_not_found(s, PDS):
+    async with s.get(
+        PDS + "/xrpc/com.atproto.sync.getRepo",
+        params={"did": "did:web:nonexistent.invalid"},
+    ) as r:
+        assert r.status == 404
